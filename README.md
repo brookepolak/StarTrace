@@ -1,5 +1,7 @@
 ![text logo](StarTrace_logo.png)
 
+![Demonstration of Star Trace GNN classification.](startrace_demo.gif)
+
 Creates initial conditions for N-body simulations consisting of N particles
 in N\_sc subclusters, each in a plummer distribution. The user can set the 
 virial parameter of the subclusters and the system as a whole. The subclusters
