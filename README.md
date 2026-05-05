@@ -1,4 +1,4 @@
-# StarTrace
+![text logo](StarTrace_logo.png)
 
 Creates initial conditions for N-body simulations consisting of N particles
 in N\_sc subclusters, each in a plummer distribution. The user can set the 
