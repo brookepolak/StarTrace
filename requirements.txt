@@ -1,0 +1,29 @@
+# StarTrace Requirements
+# ======================
+#
+# Core dependencies for StarTrace GNN framework
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# Note: PyTorch installation may vary based on your system (CPU/GPU, CUDA version)
+# See https://pytorch.org/get-started/locally/ for platform-specific instructions
+
+# Deep Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Graph Neural Networks
+torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.15
+
+# Numerical Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Visualization
+matplotlib>=3.7.0
+cmasher>=1.6.0
+
