@@ -7,7 +7,7 @@ StarTrace is a Graph Neural Net (GNN) trained on 1000s of [PeTar](https://github
 ```
 StarTrace/
 ├── predict.py            # Generic template for predictions from txt file data
-├── gaia_dr3.py           # Predictions for the Hunt & Reffert 2023 catalog of Gaia DR3 sources
+├── gaia_dr3.py           # Grabs data from the Hunt & Reffert 2023 catalog of Gaia DR3 sources
 ├── model/
     ├── StarTrace.py          # Core library (all classes and utilities)
     ├── train.py              # Training CLI
