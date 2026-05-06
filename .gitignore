@@ -1,2 +1,6 @@
 .DS_Store
-*.dat
+__pycache__
+members.dat
+clusters.dat
+clusters.dat.gz
+gaia_data/

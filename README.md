@@ -12,14 +12,62 @@ StarTrace/
     ├── StarTrace.py          # Core library (all classes and utilities)
     ├── train.py              # Training CLI
     ├── validate.py           # Validation CLI
+├── simulate/
+    ├── generate_ics.py       # Class for making training simulations
+    ├── make_suite.py         # Script to make an initial condition file
+    ├── scripts/              # Example bash scripts for setting up a suite and submitting to SLURM
 ```
 
 # Predict
 
-The CLIs for using the trained StarTrace model to predict cluster histories can be found in ```predict.py, gaia_dr3.py```. The CLI for generic data (a simple text file of positions & velocities) can be found in ```predict/predict.py```.  
+The CLI for using the trained StarTrace model to predict cluster histories can be found in ```predict.py```. This is for generic data: a simple text file of positions & velocities. Simply run:
+```
+predict.py data.txt
+```
+This will give you a prediction of the clusters history, and the uncertainties calculated with the Monte Carlo dropout method. 
 
-A file for extracting and classifying star clusters with full 6D phase space information from the Gaia DR3 ([Hunt & Reffert 2023](https://cdsarc.cds.unistra.fr/viz-bin/cat/J/A+A/673/A114#/article)) can be found in ```predict/gaia_dr3.py```. 
+### Gaia data
 
+A script for extracting data for young star clusters (<100 Myr) with full 6D phase space information from the Gaia DR3 release ([Hunt & Reffert 2023](https://cdsarc.cds.unistra.fr/viz-bin/cat/J/A+A/673/A114#/article)) can be found in ```gaia_dr3.py```. Running this will produce a folder called ```gaia_data```, where each cluster will have its own text file filled with the members 6D kinematic information. StarTrace can be used for classifying these clusters the the ```predict``` script. 
+
+### Example: Trumpler 3
+
+```
+python predict.py gaia_data/Trumpler_3.txt
+```
+
+##### Output:
+
+```
+Loading model from model/outputs/StarTrace_best_model.pt...
+Model loaded successfully!
+  Trained epoch: 50
+  Validation accuracy: 97.82%
+
+Loading cluster data from gaia_data/Trumpler_3.txt...
+  Loaded 146 stars
+  Processing cluster with 146 stars
+
+======================================================================
+PREDICTION SUMMARY
+======================================================================
+
+Predicted: 3+ subclusters
+Confidence: 82.8%
+Uncertainty (entropy): 0.556
+
+Top 3 predictions:
+ Rank             NSC  Probability       ±Std
+---------------------------------------------
+    1  3+ subclusters       82.8%       9.0%
+    2   2 subclusters       12.9%       6.9%
+    3    1 subcluster        4.3%       2.8%
+
+======================================================================
+
+
+Done!
+```
 
 # Train
 

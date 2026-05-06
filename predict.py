@@ -37,7 +37,7 @@ import json
 from pathlib import Path
 
 # Import from StarTrace library
-from StarTrace import Predictor
+from model.StarTrace import Predictor
 
 
 def parse_args():
