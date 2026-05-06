@@ -6,9 +6,8 @@ StarTrace is a Graph Neural Net (GNN) trained on 1000s of [PeTar](https://github
 
 ```
 StarTrace/
-├── predict.py            # Generic template for predictions
+├── predict.py            # Generic template for predictions from txt file data
 ├── gaia_dr3.py           # Predictions for the Hunt & Reffert 2023 catalog of Gaia DR3 sources
-
 ├── model/
     ├── StarTrace.py          # Core library (all classes and utilities)
     ├── train.py              # Training CLI
@@ -17,7 +16,7 @@ StarTrace/
 
 # Predict
 
-The CLIs for using the trained StarTrace model to predict cluster histories can be found in ```predict.py, gaia_dr3.py```. The CLI for generic data, a simple text file of positions & velocities, or an AMUSE particle set, can be found in ```predict/predict.py```.  
+The CLIs for using the trained StarTrace model to predict cluster histories can be found in ```predict.py, gaia_dr3.py```. The CLI for generic data (a simple text file of positions & velocities) can be found in ```predict/predict.py```.  
 
 A file for extracting and classifying star clusters with full 6D phase space information from the Gaia DR3 ([Hunt & Reffert 2023](https://cdsarc.cds.unistra.fr/viz-bin/cat/J/A+A/673/A114#/article)) can be found in ```predict/gaia_dr3.py```. 
 
