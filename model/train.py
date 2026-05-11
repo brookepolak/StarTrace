@@ -110,7 +110,7 @@ The model automatically handles imbalanced datasets using class weighting.
     )
     model_group.add_argument(
         "--use_global_features",
-        action="store_true",
+        action="store_false",
         help="Include global cluster-level features (may not improve accuracy)"
     )
     
