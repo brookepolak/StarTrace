@@ -1447,13 +1447,18 @@ class Validator:
 
     def save_accuracy(self, results: Dict, save_path: Path):
         """
-        Save per-class (and overall) accuracy to a plain-text file.
+        Save the full validation confusion matrix to a plain-text file.
 
-        The file is written in a loadtxt-friendly format with one row per
-        class, so accuracies from many snapshots can be concatenated and
-        plotted easily later. Columns are:
+        The matrix is written in a tidy (long) loadtxt-friendly format with
+        one row per (true, predicted) cell holding the raw integer count::
 
-            snapshot  class_index  accuracy  n_samples
+            snapshot  true_class  pred_class  count
+
+        From these raw counts every downstream quantity is derivable:
+            per-class accuracy = count[i, i] / sum_j count[i, j]
+            n_samples (class i) = sum_j count[i, j]
+            overall accuracy    = sum_i count[i, i] / total
+            off-diagonal cells (j != i) = misclassifications
 
         Metadata (snapshot, n_classes, overall accuracy, class labels) is
         stored in the leading comment lines.
@@ -1467,24 +1472,28 @@ class Validator:
         labels = get_class_labels(self.n_classes)
         overall = (predictions == true_labels).mean()
 
+        # Confusion matrix of raw counts: cm[true, pred]
+        cm = np.zeros((self.n_classes, self.n_classes), dtype=int)
+        for true, pred in zip(true_labels, predictions):
+            cm[true, pred] += 1
+
         save_path = Path(save_path)
         save_path.parent.mkdir(exist_ok=True, parents=True)
 
         with open(save_path, 'w') as f:
-            f.write("# StarTrace per-class validation accuracy\n")
+            f.write("# StarTrace validation confusion matrix\n")
             f.write(f"# snapshot: {Config.SNAPSHOT}\n")
             f.write(f"# n_classes: {self.n_classes}\n")
             f.write(f"# overall_accuracy: {overall:.6f}\n")
             f.write(f"# class_labels: {', '.join(labels)}\n")
-            f.write("# snapshot class_index accuracy n_samples\n")
+            f.write("# values: raw counts (cm[true, pred])\n")
+            f.write("# snapshot true_class pred_class count\n")
 
-            for cls in range(self.n_classes):
-                mask = true_labels == cls
-                n = int(mask.sum())
-                acc = (predictions[mask] == cls).mean() if n > 0 else float('nan')
-                f.write(f"{Config.SNAPSHOT} {cls} {acc:.6f} {n}\n")
+            for i in range(self.n_classes):
+                for j in range(self.n_classes):
+                    f.write(f"{Config.SNAPSHOT} {i} {j} {int(cm[i, j])}\n")
 
-        print(f"Saved per-class accuracy to {save_path}")
+        print(f"Saved confusion matrix / accuracy to {save_path}")
 
     def run(self) -> Dict:
         """

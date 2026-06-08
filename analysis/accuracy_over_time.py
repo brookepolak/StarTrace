@@ -2,33 +2,33 @@
 StarTrace Accuracy Over Time
 ============================
 
-Evaluates the trained model in each snapshot output folder (outputs-snapX)
-and plots the per-class validation accuracy as a function of snapshot (time).
+Reads the per-class accuracy text files written by the validation step
+(`accuracy.txt` inside each outputs-snapX folder) and plots the per-class
+validation accuracy as a function of snapshot (time).
 
-Each folder is expected to contain a `StarTrace_best_model.pt` checkpoint
-produced by train.py (e.g. via submit_snapshots.sh). The snapshot timestep
-and class configuration are read from each checkpoint, so the models are
-evaluated on the same snapshot they were trained on.
+Each `accuracy.txt` is produced by Validator.save_accuracy() and looks like:
+
+    # StarTrace per-class validation accuracy
+    # snapshot: 30
+    # n_classes: 3
+    # overall_accuracy: 0.861200
+    # class_labels: 1 subcluster, 2 subclusters, 3+ subclusters
+    # snapshot class_index accuracy n_samples
+    30 0 0.853400 120
+    30 1 0.791200 118
+    30 2 0.900100 340
 
 Usage:
-    python accuracy_over_time.py --data_path /path/to/sims/ --models_dir /path/to/models/
-    python accuracy_over_time.py --data_path /path/to/sims/ --snapshots 10-50
+    python accuracy_over_time.py --models_dir /path/to/models/
+    python accuracy_over_time.py --models_dir . --snapshots 10-50
 """
 
-import sys
 import re
 import argparse
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
-
-# Make the StarTrace library (in ../model) importable
-MODEL_DIR = Path(__file__).resolve().parent.parent / "model"
-sys.path.insert(0, str(MODEL_DIR))
-
-from StarTrace import Config, Validator, get_class_labels  # noqa: E402
 
 # Beautiful colormap
 try:
@@ -46,38 +46,140 @@ plt.rcParams.update({
 })
 
 
-class AccuracyOverTime:
-    """Evaluate per-class accuracy of snapshot models over time."""
+def parse_accuracy_file(path: Path) -> dict:
+    """
+    Parse an accuracy.txt file written by Validator.save_accuracy().
 
-    def __init__(self, data_path: str, models_dir: str,
-                 n_seeds: int = 300, n_scs: int = 8):
+    The current format is a tidy confusion matrix with one row per cell:
+
+        # snapshot true_class pred_class count
+        30 0 0 102
+        30 0 1 12
+        ...
+
+    Per-class accuracy and sample counts are derived from the raw counts:
+        accuracy[i]  = cm[i, i] / sum_j cm[i, j]
+        n_samples[i] = sum_j cm[i, j]
+
+    (The older 4-column "snapshot class_index accuracy n_samples" layout is
+    still recognised for backward compatibility.)
+
+    Returns a dict with keys:
+        snapshot         (int)
+        n_classes        (int)
+        overall_accuracy (float)
+        class_labels     (list[str])
+        class_index      (np.ndarray)
+        accuracy         (np.ndarray)   per-class accuracy
+        n_samples        (np.ndarray)   per-class sample counts
+        confusion        (np.ndarray)   full count matrix, or None
+    """
+    meta = {
+        'snapshot': None,
+        'n_classes': None,
+        'overall_accuracy': np.nan,
+        'class_labels': [],
+    }
+    is_tidy = None          # True once we detect the confusion-matrix header
+    rows = []               # raw data rows (list of token lists)
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                body = line.lstrip('#').strip()
+                if body.startswith('snapshot:'):
+                    meta['snapshot'] = int(body.split(':', 1)[1])
+                elif body.startswith('n_classes:'):
+                    meta['n_classes'] = int(body.split(':', 1)[1])
+                elif body.startswith('overall_accuracy:'):
+                    meta['overall_accuracy'] = float(body.split(':', 1)[1])
+                elif body.startswith('class_labels:'):
+                    labels = body.split(':', 1)[1]
+                    meta['class_labels'] = [s.strip() for s in labels.split(',')]
+                elif 'pred_class' in body:
+                    is_tidy = True
+                elif 'class_index' in body:
+                    is_tidy = False
+                continue
+
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            if meta['snapshot'] is None:
+                meta['snapshot'] = int(parts[0])
+            rows.append(parts)
+
+    # Fall back to detecting the layout from the data if no column header
+    # comment was present: an old-format accuracy column contains a '.'.
+    if is_tidy is None and rows:
+        is_tidy = '.' not in rows[0][2]
+
+    if is_tidy:
+        n = meta['n_classes']
+        if n is None:
+            n = int(round(len(rows) ** 0.5))
+            meta['n_classes'] = n
+        cm = np.zeros((n, n), dtype=float)
+        for parts in rows:
+            i, j, count = int(parts[1]), int(parts[2]), float(parts[3])
+            cm[i, j] = count
+        row_sums = cm.sum(axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            accuracy = np.where(row_sums > 0, np.diag(cm) / row_sums, np.nan)
+        meta['confusion'] = cm
+        meta['class_index'] = np.arange(n)
+        meta['accuracy'] = accuracy
+        meta['n_samples'] = row_sums.astype(int)
+    else:
+        # Legacy per-class layout: snapshot class_index accuracy n_samples
+        class_index = [int(p[1]) for p in rows]
+        meta['confusion'] = None
+        meta['class_index'] = np.array(class_index)
+        meta['accuracy'] = np.array([float(p[2]) for p in rows])
+        meta['n_samples'] = np.array([int(p[3]) for p in rows])
+        if meta['n_classes'] is None:
+            meta['n_classes'] = len(class_index)
+
+    return meta
+
+
+class AccuracyOverTime:
+    """Collect per-class accuracy from snapshot output folders over time."""
+
+    def __init__(self, models_dir: str, accuracy_filename: str = "accuracy.txt"):
         """
         Args:
-            data_path: Path to simulation directory (NSC*SEED* folders)
-            models_dir: Directory containing outputs-snapX model folders
-            n_seeds: Number of random seeds per NSC class
-            n_scs: Maximum NSC value in dataset
+            models_dir: Directory containing the outputs-snapX folders.
+            accuracy_filename: Name of the per-folder accuracy file.
         """
-        self.data_path = data_path
         self.models_dir = Path(models_dir)
-        self.n_seeds = n_seeds
-        self.n_scs = n_scs
+        self.accuracy_filename = accuracy_filename
 
         # Time series storage
-        self.snapshots = []          # snapshot timestep per model
-        self.per_class_acc = []      # list of arrays, one per snapshot
-        self.overall_acc = []        # overall accuracy per snapshot
+        self.snapshots = []          # snapshot per folder
+        self.per_class_acc = []      # list of per-class accuracy arrays
+        self.overall_acc = []        # overall accuracy per folder
         self.n_classes = None
+        self.class_labels = None
 
-    def find_model_dirs(self, snapshots=None):
+    def find_accuracy_files(self, snapshots=None):
         """
-        Locate outputs-snapX folders containing a trained model.
+        Locate outputs-snapX/accuracy.txt files.
 
         Args:
             snapshots: Optional iterable of snapshot numbers to restrict to.
 
         Returns:
-            Sorted list of (snapshot_number, model_path) tuples.
+            Sorted list of (snapshot_number, accuracy_file_path) tuples. The
+            snapshot number is taken from the folder name; the authoritative
+            value is read from the file itself during parsing.
+
+        The accuracy file is read from the ``plots/`` subdirectory of each
+        snapshot folder, where the validation step launched by train.py
+        writes it.
         """
         found = []
         pattern = re.compile(r"outputs[-_]snap(\d+)$")
@@ -93,113 +195,74 @@ class AccuracyOverTime:
             if snapshots is not None and snap not in snapshots:
                 continue
 
-            model_path = folder / "StarTrace_best_model.pt"
-            if not model_path.exists():
-                print(f"  Warning: no model in {folder.name}, skipping...")
+            acc_file = folder / "plots" / self.accuracy_filename
+            if not acc_file.exists():
+                print(f"  Warning: no plots/{self.accuracy_filename} in "
+                      f"{folder.name}, skipping...")
                 continue
 
-            found.append((snap, model_path))
+            found.append((snap, acc_file))
 
         found.sort(key=lambda x: x[0])
         return found
 
-    def evaluate_model(self, model_path: Path):
-        """
-        Run validation for a single model checkpoint.
-
-        Returns:
-            (snapshot, per_class_accuracy, overall_accuracy) or None on failure.
-        """
-        # Read checkpoint config so we evaluate on the correct snapshot/classes
-        checkpoint = torch.load(model_path, map_location="cpu")
-        cfg = checkpoint.get('config', {}) if isinstance(checkpoint, dict) else {}
-
-        Config.update(
-            N_CLASSES=cfg.get('N_CLASSES', Config.N_CLASSES),
-            SNAPSHOT=cfg.get('SNAPSHOT', Config.SNAPSHOT),
-            K_NEIGHBORS=cfg.get('K_NEIGHBORS', Config.K_NEIGHBORS),
-            HIDDEN_DIM=cfg.get('HIDDEN_DIM', Config.HIDDEN_DIM),
-            USE_GLOBAL_FEATURES=cfg.get('USE_GLOBAL_FEATURES',
-                                        Config.USE_GLOBAL_FEATURES),
-        )
-        snapshot = Config.SNAPSHOT
-
-        # Use the Validator to load data + run inference (no plots generated)
-        validator = Validator(
-            model_path=str(model_path),
-            data_path=self.data_path,
-            output_dir=str(model_path.parent / "_acc_tmp"),
-            n_seeds=self.n_seeds,
-            n_scs=self.n_scs,
-        )
-        validator.load_model_and_data()
-        results = validator.collect_predictions()
-
-        predictions = results['predictions']
-        true_labels = results['true_labels']
-        n_classes = validator.n_classes
-
-        # Per-class accuracy (NaN where a class is absent in the val set)
-        class_acc = np.full(n_classes, np.nan)
-        for cls in range(n_classes):
-            mask = true_labels == cls
-            if mask.sum() > 0:
-                class_acc[cls] = (predictions[mask] == cls).mean()
-
-        overall = (predictions == true_labels).mean()
-        return snapshot, class_acc, overall, n_classes
-
     def run(self, snapshots=None):
-        """Evaluate all snapshot models and store the time series."""
-        model_dirs = self.find_model_dirs(snapshots)
+        """Read all accuracy files and assemble the time series."""
+        acc_files = self.find_accuracy_files(snapshots)
 
-        if not model_dirs:
-            print("ERROR: No snapshot model folders found!")
+        if not acc_files:
+            print("ERROR: No accuracy.txt files found in snapshot folders!")
             return False
 
-        print(f"\nFound {len(model_dirs)} snapshot model(s) to evaluate.")
+        print(f"\nFound {len(acc_files)} accuracy file(s).")
 
-        for snap, model_path in model_dirs:
-            print(f"\n{'─'*60}")
-            print(f"Evaluating snapshot {snap}: {model_path.parent.name}")
-            print(f"{'─'*60}")
-
+        for snap, acc_file in acc_files:
             try:
-                snapshot, class_acc, overall, n_classes = \
-                    self.evaluate_model(model_path)
+                info = parse_accuracy_file(acc_file)
             except Exception as e:
-                print(f"  Warning: failed to evaluate {model_path.parent.name}: {e}")
+                print(f"  Warning: failed to parse {acc_file}: {e}")
                 continue
+
+            n_classes = info['n_classes']
 
             if self.n_classes is None:
                 self.n_classes = n_classes
+                self.class_labels = info['class_labels']
             elif n_classes != self.n_classes:
-                print(f"  Warning: {model_path.parent.name} has {n_classes} "
+                print(f"  Warning: {acc_file.parent.name} has {n_classes} "
                       f"classes (expected {self.n_classes}), skipping...")
                 continue
 
-            self.snapshots.append(snapshot)
-            self.per_class_acc.append(class_acc)
-            self.overall_acc.append(overall)
+            # Order per-class accuracy by class index
+            class_acc = np.full(self.n_classes, np.nan)
+            for idx, acc in zip(info['class_index'], info['accuracy']):
+                if 0 <= idx < self.n_classes:
+                    class_acc[idx] = acc
 
-            labels = get_class_labels(n_classes)
+            self.snapshots.append(info['snapshot'])
+            self.per_class_acc.append(class_acc)
+            self.overall_acc.append(info['overall_accuracy'])
+
             acc_str = ", ".join(
-                f"{labels[c]}: {class_acc[c]*100:.1f}%"
-                for c in range(n_classes)
+                f"cls{c}: {class_acc[c]*100:.1f}%" for c in range(self.n_classes)
             )
-            print(f"  Overall: {overall*100:.1f}%  |  {acc_str}")
+            print(f"  snapshot {info['snapshot']:>3d}: "
+                  f"overall {info['overall_accuracy']*100:.1f}%  |  {acc_str}")
 
         if not self.snapshots:
-            print("\nERROR: No models evaluated successfully!")
+            print("\nERROR: No accuracy files parsed successfully!")
             return False
 
-        # Sort everything by snapshot and convert to arrays
+        # Sort by snapshot and convert to arrays
         order = np.argsort(self.snapshots)
         self.snapshots = np.array(self.snapshots)[order]
         self.per_class_acc = np.array(self.per_class_acc)[order]  # (n_snap, n_cls)
         self.overall_acc = np.array(self.overall_acc)[order]
 
-        print(f"\nEvaluated {len(self.snapshots)} snapshots successfully.")
+        if self.class_labels is None or len(self.class_labels) != self.n_classes:
+            self.class_labels = [f"class {c}" for c in range(self.n_classes)]
+
+        print(f"\nCollected {len(self.snapshots)} snapshots.")
         return True
 
 
@@ -208,7 +271,7 @@ def plot_accuracy_over_time(analyzer, save_path=None):
     fig, ax = plt.subplots(figsize=(10, 6))
 
     n_classes = analyzer.n_classes
-    labels = get_class_labels(n_classes)
+    labels = analyzer.class_labels
     colors = [CMAP(i / max(n_classes - 1, 1)) for i in range(n_classes)]
 
     snaps = analyzer.snapshots
@@ -222,7 +285,9 @@ def plot_accuracy_over_time(analyzer, save_path=None):
                 color=colors[cls], label=labels[cls])
 
     # Overall accuracy as a reference (dashed black)
-    ax.plot(snaps, analyzer.overall_acc * 100.0,
+    overall = analyzer.overall_acc * 100.0
+    mask = np.isfinite(overall)
+    ax.plot(snaps[mask], overall[mask],
             linestyle='--', linewidth=1.5, color='black',
             alpha=0.7, label='Overall')
 
@@ -266,10 +331,8 @@ def main(args):
     snapshots = parse_snapshots(args.snapshots)
 
     analyzer = AccuracyOverTime(
-        data_path=args.data_path,
         models_dir=args.models_dir,
-        n_seeds=args.n_seeds,
-        n_scs=args.n_scs,
+        accuracy_filename=args.accuracy_filename,
     )
 
     success = analyzer.run(snapshots)
@@ -281,15 +344,15 @@ def main(args):
         save_path=args.output_dir / "accuracy_over_time.png",
     )
 
-    # Also save the raw numbers for later use
+    # Also save the assembled time series for later use
     np.savez(
         args.output_dir / "accuracy_over_time.npz",
         snapshots=analyzer.snapshots,
         per_class_accuracy=analyzer.per_class_acc,
         overall_accuracy=analyzer.overall_acc,
-        class_labels=np.array(get_class_labels(analyzer.n_classes)),
+        class_labels=np.array(analyzer.class_labels),
     )
-    print(f"Saved raw results to {args.output_dir / 'accuracy_over_time.npz'}")
+    print(f"Saved combined results to {args.output_dir / 'accuracy_over_time.npz'}")
 
     print("\n" + "=" * 60)
     print("Analysis complete!")
@@ -298,19 +361,13 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Plot per-class accuracy of snapshot models over time"
-    )
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        required=True,
-        help="Path to simulation directory containing NSC*SEED* folders"
+        description="Plot per-class accuracy from snapshot accuracy.txt files"
     )
     parser.add_argument(
         "--models_dir",
         type=str,
         default=".",
-        help="Directory containing the outputs-snapX model folders (default: .)"
+        help="Directory containing the outputs-snapX folders (default: .)"
     )
     parser.add_argument(
         "--snapshots",
@@ -320,16 +377,10 @@ if __name__ == "__main__":
              "(default: all found)"
     )
     parser.add_argument(
-        "--n_seeds",
-        type=int,
-        default=300,
-        help="Number of random seeds per NSC class (default: 300)"
-    )
-    parser.add_argument(
-        "--n_scs",
-        type=int,
-        default=8,
-        help="Maximum NSC value in dataset (default: 8)"
+        "--accuracy_filename",
+        type=str,
+        default="accuracy.txt",
+        help="Name of the per-folder accuracy file (default: accuracy.txt)"
     )
     parser.add_argument(
         "--output_dir",
