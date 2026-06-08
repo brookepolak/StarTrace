@@ -30,6 +30,11 @@ Usage:
 
     # Re-plot from an existing HDF5 file without re-processing
     python sc_analysis.py --from_h5 cluster_evolution.h5
+
+    # Append a new snapshot range to each sim already in the HDF5 file
+    # (only the new snapshots are computed; the file is updated in place)
+    python sc_analysis.py --data_path /path/to/sims/ --compare_all --update \\
+        --min_snapshot 21 --max_snapshot 50
 """
 
 import argparse
@@ -175,18 +180,22 @@ class ClusterAnalysis:
     SERIES_FIELDS = ("time", "hmr", "t_relax")
 
     def __init__(self, data_path: str, n_seeds: int = 300,
-                 n_scs: int = 8, max_snapshot: int = 20):
+                 n_scs: int = 8, max_snapshot: int = 20, min_snapshot: int = 0):
         """
         Args:
             data_path: Path to simulation directory (NSC*SEED* folders)
             n_seeds: Number of random seeds per NSC class
             n_scs: Maximum NSC value in dataset (1..n_scs)
             max_snapshot: Maximum snapshot index to analyze
+            min_snapshot: Minimum snapshot index to analyze. Process only a
+                sub-range (e.g. 21..50) to append to an existing HDF5 file
+                without recomputing the snapshots already stored.
         """
         self.data_path = Path(data_path) if data_path is not None else None
         self.n_seeds = n_seeds
         self.n_scs = n_scs
         self.max_snapshot = max_snapshot
+        self.min_snapshot = min_snapshot
 
         # sim_name -> dict of time series + metadata
         self.data = {}
@@ -295,7 +304,7 @@ class ClusterAnalysis:
 
         times, hmrs, t_relaxes = [], [], []
 
-        for snapshot in range(self.max_snapshot + 1):
+        for snapshot in range(self.min_snapshot, self.max_snapshot + 1):
             result = self.load_snapshot(sim_dir, snapshot)
             if result is None:
                 continue
@@ -380,6 +389,95 @@ class ClusterAnalysis:
                 grp.attrs['seed'] = sim['seed']
 
         print(f"Saved {len(self.data)} simulations to {h5_path}")
+
+    @staticmethod
+    def _merge_series(old, new):
+        """
+        Merge two per-sim data dicts by snapshot (time).
+
+        Snapshots present in both are taken from ``new`` (recomputed values
+        win); the union is returned sorted by time. Used to splice freshly
+        processed snapshots into an existing record.
+        """
+        merged = {}
+        for t, h, r in zip(old["time"], old["hmr"], old["t_relax"]):
+            merged[int(t)] = (float(h), float(r))
+        for t, h, r in zip(new["time"], new["hmr"], new["t_relax"]):
+            merged[int(t)] = (float(h), float(r))
+
+        times = sorted(merged)
+        return {
+            "time": np.array(times),
+            "hmr": np.array([merged[t][0] for t in times]),
+            "t_relax": np.array([merged[t][1] for t in times]),
+            "nsc": new.get("nsc", old.get("nsc")),
+            "seed": new.get("seed", old.get("seed")),
+        }
+
+    def update_h5(self, h5_path: str):
+        """
+        Append/merge ``self.data`` into an existing HDF5 file in place.
+
+        Only the simulations present in ``self.data`` are touched: for each,
+        the newly processed snapshots are merged with whatever is already
+        stored (see ``_merge_series``) and that sim's datasets are rewritten.
+        Simulations already in the file but not re-processed are left
+        untouched -- the whole file is never rewritten.
+
+        If the file does not exist yet, it is created (equivalent to
+        ``save_h5`` for the processed sims).
+
+        Note: HDF5 does not reclaim space from deleted datasets, so a file
+        updated many times may grow on disk; ``h5repack`` can compact it.
+        """
+        if not self.data:
+            print("Nothing to update (no processed data).")
+            return
+
+        h5_path = Path(h5_path)
+        h5_path.parent.mkdir(exist_ok=True, parents=True)
+
+        n_new, n_extended = 0, 0
+        with h5py.File(h5_path, 'a') as f:
+            # Ensure file-level metadata exists (new file or pre-existing)
+            f.attrs.setdefault('description',
+                               "StarTrace cluster evolution time series")
+            f.attrs.setdefault('time_units', "snapshot index")
+            f.attrs.setdefault('hmr_units', "pc")
+            f.attrs.setdefault('t_relax_units', "Myr")
+
+            for sim_name, sim in self.data.items():
+                if sim_name in f:
+                    grp = f[sim_name]
+                    existing = {
+                        "time": grp["time"][...],
+                        "hmr": grp["hmr"][...],
+                        "t_relax": grp["t_relax"][...],
+                        "nsc": int(grp.attrs.get("nsc", sim["nsc"])),
+                        "seed": int(grp.attrs.get("seed", sim["seed"])),
+                    }
+                    record = self._merge_series(existing, sim)
+                    # Rewrite just this sim's datasets (delete + recreate)
+                    for field in self.SERIES_FIELDS:
+                        if field in grp:
+                            del grp[field]
+                    n_extended += 1
+                else:
+                    grp = f.create_group(sim_name)
+                    record = sim
+                    n_new += 1
+
+                for field in self.SERIES_FIELDS:
+                    grp.create_dataset(field, data=record[field])
+                grp.attrs['nsc'] = record['nsc']
+                grp.attrs['seed'] = record['seed']
+
+            # Track the overall snapshot extent seen across updates
+            prev_max = int(f.attrs.get('max_snapshot', self.max_snapshot))
+            f.attrs['max_snapshot'] = max(prev_max, self.max_snapshot)
+
+        print(f"Updated {h5_path}: {n_new} new sim(s), "
+              f"{n_extended} extended.")
 
     def load_h5(self, h5_path: str):
         """
@@ -505,6 +603,7 @@ def main(args):
         n_seeds=args.n_seeds,
         n_scs=args.n_scs,
         max_snapshot=args.max_snapshot,
+        min_snapshot=args.min_snapshot,
     )
 
     # ── Re-plot only, from an existing HDF5 file ──────────────────────
@@ -537,10 +636,17 @@ def main(args):
         print("ERROR: No valid simulations found!")
         return
 
-    # ── Save to HDF5 ──────────────────────────────────────────────────
-    analysis.save_h5(args.output_h5)
+    # ── Write to HDF5 ─────────────────────────────────────────────────
+    # --update merges into an existing file (appending new snapshots to each
+    # sim); otherwise the file is written fresh. Auto-switch to update mode
+    # if the target file already exists, to avoid clobbering it.
+    if args.update or Path(args.output_h5).exists():
+        analysis.update_h5(args.output_h5)
+    else:
+        analysis.save_h5(args.output_h5)
 
-    # ── Plot ──────────────────────────────────────────────────────────
+    # ── Plot (from the full on-disk record, including any prior snapshots) ─
+    analysis.load_h5(args.output_h5)
     analysis.plot_combined(save_path=args.output_dir / "evolution_combined.png")
 
     print("\n" + "=" * 60)
@@ -579,6 +685,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_snapshot", type=int, default=20,
         help="Maximum snapshot to analyze"
+    )
+    parser.add_argument(
+        "--min_snapshot", type=int, default=0,
+        help="Minimum snapshot to analyze. Use with --update to append a new "
+             "snapshot sub-range (e.g. --min_snapshot 21 --max_snapshot 50) "
+             "to each sim already in the HDF5 file (default: 0)"
+    )
+    parser.add_argument(
+        "--update", action="store_true",
+        help="Merge the processed snapshots into an existing HDF5 file in "
+             "place instead of rewriting it (auto-enabled if the file exists)"
     )
     parser.add_argument(
         "--output_h5", type=str, default="outputs/analysis/cluster_evolution.h5",
