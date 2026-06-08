@@ -19,8 +19,11 @@ Usage:
     # Customize hyperparameters
     python train.py --data_path /path/to/sims/ --n_classes 4 --hidden_dim 256
     
-    # Use different snapshot and k-NN settings
-    python train.py --data_path /path/to/sims/ --snapshot 10 --k_neighbors 64
+    # Train one model across a range of snapshots (cluster ages)
+    python train.py --data_path /path/to/sims/ --snapshots 10-50
+
+    # Train on a single snapshot
+    python train.py --data_path /path/to/sims/ --snapshot 30
 
 For more information, see: python train.py --help
 """
@@ -30,7 +33,7 @@ import sys
 from pathlib import Path
 
 # Import from StarTrace library
-from StarTrace import Trainer, Validator, Config
+from StarTrace import Trainer, Validator, Config, parse_snapshot_spec
 
 
 def parse_args():
@@ -49,8 +52,9 @@ Examples:
   # Customize training parameters
   python train.py --data_path /path/to/sims/ --epochs 150 --lr 0.0001 --batch_size 128
   
-  # Use specific snapshot and k-NN settings
-  python train.py --data_path /path/to/sims/ --snapshot 10 --k_neighbors 64
+  # Train across a snapshot range (default) or a single snapshot
+  python train.py --data_path /path/to/sims/ --snapshots 10-50
+  python train.py --data_path /path/to/sims/ --snapshot 30
 
 Class Systems:
   3-class: [1 subcluster, 2 subclusters, 3+ subclusters]
@@ -81,12 +85,21 @@ The model automatically handles imbalanced datasets using class weighting.
         help="Maximum NSC value in dataset, e.g., 8 for NSC1-NSC8 (default: 8)"
     )
     data_group.add_argument(
+        "--snapshots",
+        type=str,
+        default="10-50",
+        help="Snapshot(s) to train on: a single number ('30'), a range "
+             "('10-50'), or a list ('10,20,30'). Training on a range builds "
+             "one model spanning all those cluster ages (default: 10-50)"
+    )
+    data_group.add_argument(
         "--snapshot",
         type=int,
-        default=15,
-        help="Simulation snapshot timestep to load (default: 15)"
+        default=None,
+        help="Convenience shortcut to train on a single snapshot; overrides "
+             "--snapshots when given (e.g. --snapshot 30)"
     )
-    
+
     # Model arguments
     model_group = parser.add_argument_group('Model Architecture')
     model_group.add_argument(
@@ -168,11 +181,22 @@ The model automatically handles imbalanced datasets using class weighting.
 def main():
     """Main training function."""
     args = parse_args()
-    
+
+    # Resolve which snapshot(s) to train on. --snapshot (single) wins if set,
+    # otherwise parse the --snapshots spec (single number, range, or list).
+    if args.snapshot is not None:
+        snapshots = [args.snapshot]
+    else:
+        snapshots = parse_snapshot_spec(args.snapshots)
+
+    if not snapshots:
+        print(f"✗ Error: no valid snapshots parsed from '{args.snapshots}'")
+        sys.exit(1)
+
     # Update configuration with command-line arguments
     Config.update(
         N_CLASSES=args.n_classes,
-        SNAPSHOT=args.snapshot,
+        SNAPSHOTS=snapshots,
         K_NEIGHBORS=args.k_neighbors,
         HIDDEN_DIM=args.hidden_dim,
         BATCH_SIZE=args.batch_size,

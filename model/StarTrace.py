@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 import json
 
-from torch.utils.data import random_split
+from torch.utils.data import Subset
 from torch_geometric.data import Data, Dataset, DataLoader
 from torch_geometric.nn import SAGEConv, global_mean_pool, global_max_pool
 from torch_geometric.transforms import KNNGraph
@@ -70,7 +70,9 @@ class Config:
     
     Attributes:
         N_CLASSES (int): Number of classification classes (e.g., 3 for [1, 2, 3+])
-        SNAPSHOT (int): Which simulation snapshot to load (timestep)
+        SNAPSHOTS (List[int]): Which simulation snapshot(s) to train on. A
+            single-element list trains on one timestep; a range (e.g.
+            10..50) trains one model across all those ages at once.
         K_NEIGHBORS (int): Number of nearest neighbors for k-NN graph construction
         HIDDEN_DIM (int): Hidden layer dimensionality in GNN
         BATCH_SIZE (int): Training batch size
@@ -89,7 +91,7 @@ class Config:
     
     # Data parameters
     N_CLASSES = 3           # Number of classes: 1, 2, 3+ subclusters
-    SNAPSHOT = 15           # Which simulation snapshot to use
+    SNAPSHOTS = [15]        # Which simulation snapshot(s) to train on (list)
     
     # Model architecture
     K_NEIGHBORS = 32        # k-NN graph connectivity in phase space
@@ -367,8 +369,54 @@ def create_labels(class_idx: int, n_classes: int = None) -> torch.Tensor:
     
     y = torch.zeros(n_classes)
     y[class_idx] = 1.0
-    
+
     return y
+
+
+def parse_snapshot_spec(spec) -> List[int]:
+    """
+    Parse a snapshot specification into a sorted list of integers.
+
+    Accepts:
+        - an int, e.g. 30                 -> [30]
+        - a single-number string "30"     -> [30]
+        - a range string "10-50"          -> [10, 11, ..., 50]
+        - a comma list "10,20,30"         -> [10, 20, 30]
+        - a list/tuple of ints            -> sorted unique list
+
+    This is what powers the "single snapshot or range" training option.
+    """
+    if isinstance(spec, int):
+        return [spec]
+    if isinstance(spec, (list, tuple)):
+        return sorted({int(s) for s in spec})
+
+    snaps = set()
+    for part in str(spec).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-')
+            snaps.update(range(int(lo), int(hi) + 1))
+        else:
+            snaps.add(int(part))
+    return sorted(snaps)
+
+
+def format_snapshots(snapshots: List[int]) -> str:
+    """
+    Compact, human-readable label for a list of snapshots.
+
+    A single snapshot renders as its number ("30"); a contiguous range
+    renders as "lo-hi" ("10-50"); anything else as a comma list.
+    """
+    snaps = sorted(set(int(s) for s in snapshots))
+    if len(snaps) == 1:
+        return str(snaps[0])
+    if snaps == list(range(snaps[0], snaps[-1] + 1)):
+        return f"{snaps[0]}-{snaps[-1]}"
+    return ",".join(str(s) for s in snaps)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -387,22 +435,34 @@ class StarClusterGraphDataset(Dataset):
         - Edge structure: k-nearest neighbors in 6D phase space
         - Graph label: number of subclusters (mapped to class index)
 
+    A simulation contributes one graph per requested snapshot, so training
+    on a range of snapshots (e.g. 10-50) loads every cluster at every age in
+    that range into a single dataset. Each graph records which simulation it
+    came from (``graph_sim_ids``) so the train/val split can be done by
+    simulation rather than by graph (avoiding the same cluster appearing, at
+    adjacent ages, in both splits).
+
     Args:
         data_path: Base directory containing simulation folders
         sim_names: List of simulation names to load (e.g., ["NSC1SEED0", ...])
-        snapshot: Which snapshot timestep to load
+        snapshots: Snapshot timestep(s) to load. May be an int, a list of
+            ints, or a spec string like "30" / "10-50" / "10,20,30".
+            Defaults to Config.SNAPSHOTS.
         k: Number of nearest neighbors for graph construction
         n_classes: Number of classification classes (default: Config.N_CLASSES)
 
     Attributes:
-        graphs: List of PyTorch Geometric Data objects
+        graphs: List of PyTorch Geometric Data objects (one per sim*snapshot)
+        graph_sim_ids: Simulation index for each graph (for sim-level split)
+        sim_names: Unique simulations that contributed at least one graph
+        snapshots: Sorted list of snapshots actually requested
         k: Number of neighbors in k-NN graph
     """
 
     def __init__(self,
                  data_path: str,
                  sim_names: List[str],
-                 snapshot: int,
+                 snapshots=None,
                  k: int = None,
                  n_classes: int = None):
         super().__init__()
@@ -411,48 +471,63 @@ class StarClusterGraphDataset(Dataset):
             k = Config.K_NEIGHBORS
         if n_classes is None:
             n_classes = Config.N_CLASSES
+        snapshots = parse_snapshot_spec(
+            snapshots if snapshots is not None else Config.SNAPSHOTS
+        )
 
         self.k = k
         self.n_classes = n_classes
+        self.snapshots = snapshots
         self.knn_transform = KNNGraph(k=k, loop=False, cosine=False)
         self.graphs = []
+        self.graph_sim_ids = []   # simulation index for each graph
+        self.sim_names = []       # unique sims that contributed >=1 graph
 
         print(f"Loading {n_classes}-class dataset from {data_path}")
         print(f"Class mapping: {', '.join([f'{i+1}→{i}' if i < n_classes-1 else f'{i+1}+→{i}' for i in range(n_classes)])}")
         print(f"k-NN graph with k={k}")
+        print(f"Snapshots: {format_snapshots(snapshots)} ({len(snapshots)} timestep(s))")
 
-        # Load all simulations
-        loaded_count = 0
+        # Load every simulation at every requested snapshot
         for sim_name in sim_names:
-            exists, coords, n_subclusters = load_simulation_data(
-                data_path, sim_name, snapshot
-            )
-            
-            if not exists:
-                continue
-            
-            # Map to class system
-            class_idx = map_nsc_to_class(n_subclusters, n_classes)
-            
-            # Derive features
-            features = derive_physical_features(coords)
-            label = create_labels(class_idx, n_classes)
-            
-            # Create graph data object
-            data = Data(
-                x=torch.tensor(features, dtype=torch.float),
-                pos=torch.tensor(coords, dtype=torch.float),
-                y=label.unsqueeze(0),  # (1, n_classes)
-            )
-            
-            # Build k-NN graph
-            data = self.knn_transform(data)
-            
-            self.graphs.append(data)
-            loaded_count += 1
-        
-        print(f"\nLoaded {loaded_count} simulations successfully")
-        if loaded_count > 0:
+            sim_id = len(self.sim_names)
+            sim_added = False
+
+            for snapshot in snapshots:
+                exists, coords, n_subclusters = load_simulation_data(
+                    data_path, sim_name, snapshot
+                )
+
+                if not exists:
+                    continue
+
+                # Map to class system
+                class_idx = map_nsc_to_class(n_subclusters, n_classes)
+
+                # Derive features
+                features = derive_physical_features(coords)
+                label = create_labels(class_idx, n_classes)
+
+                # Create graph data object
+                data = Data(
+                    x=torch.tensor(features, dtype=torch.float),
+                    pos=torch.tensor(coords, dtype=torch.float),
+                    y=label.unsqueeze(0),  # (1, n_classes)
+                )
+
+                # Build k-NN graph
+                data = self.knn_transform(data)
+
+                self.graphs.append(data)
+                self.graph_sim_ids.append(sim_id)
+                sim_added = True
+
+            if sim_added:
+                self.sim_names.append(sim_name)
+
+        print(f"\nLoaded {len(self.graphs)} graphs from {len(self.sim_names)} "
+              f"simulations across {len(snapshots)} snapshot(s)")
+        if self.graphs:
             print(f"Features per star: {self.graphs[0].x.shape[1]}")
     
     def len(self):
@@ -496,6 +571,40 @@ def print_dataset_statistics(dataset: StarClusterGraphDataset) -> List[int]:
     
     print(f"{'─'*50}\n")
     return n_per_class
+
+
+def split_indices_by_simulation(graph_sim_ids, val_fraction, seed=42):
+    """
+    Deterministically split graph indices into (train, val) by simulation.
+
+    All graphs from the same simulation are kept in the same split, so a
+    cluster never appears (at different ages) in both train and validation.
+    With one graph per simulation (single-snapshot training) this reduces to
+    an ordinary per-graph split.
+
+    Args:
+        graph_sim_ids: Sequence of simulation ids, one per graph.
+        val_fraction: Fraction of *simulations* to hold out for validation.
+        seed: RNG seed; must match between training and validation.
+
+    Returns:
+        (train_indices, val_indices) as lists of graph indices.
+    """
+    graph_sim_ids = np.asarray(graph_sim_ids)
+    unique_sims = np.unique(graph_sim_ids)
+
+    rng = np.random.default_rng(seed)
+    shuffled = unique_sims.copy()
+    rng.shuffle(shuffled)
+
+    n_val_sims = int(round(len(shuffled) * val_fraction))
+    val_sims = set(shuffled[:n_val_sims].tolist())
+
+    train_idx, val_idx = [], []
+    for i, sid in enumerate(graph_sim_ids.tolist()):
+        (val_idx if sid in val_sims else train_idx).append(i)
+
+    return train_idx, val_idx
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -998,29 +1107,27 @@ class Trainer:
         self.dataset = StarClusterGraphDataset(
             data_path=self.data_path,
             sim_names=sim_names,
-            snapshot=self.config.SNAPSHOT,
+            snapshots=self.config.SNAPSHOTS,
             k=self.config.K_NEIGHBORS,
             n_classes=self.config.N_CLASSES
         )
-        
+
         # Print statistics
         n_per_class = print_dataset_statistics(self.dataset)
-        
-        # Train/val split
-        n_val = int(len(self.dataset) * self.config.VAL_FRACTION)
-        n_train = len(self.dataset) - n_val
-        
-        train_set, val_set = random_split(
-            self.dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(42)
+
+        # Train/val split by simulation (no cluster in both splits)
+        train_idx, val_idx = split_indices_by_simulation(
+            self.dataset.graph_sim_ids, self.config.VAL_FRACTION, seed=42
         )
-        
+        train_set = Subset(self.dataset, train_idx)
+        val_set = Subset(self.dataset, val_idx)
+
         self.train_loader = DataLoader(train_set, batch_size=self.config.BATCH_SIZE, shuffle=True)
         self.val_loader = DataLoader(val_set, batch_size=self.config.BATCH_SIZE, shuffle=False)
-        
-        print(f"Train samples: {n_train}")
-        print(f"Validation samples: {n_val}")
-        
+
+        print(f"Train samples: {len(train_idx)}")
+        print(f"Validation samples: {len(val_idx)}")
+
         return n_per_class
     
     def setup_model(self, n_features: int, n_per_class: List[int]):
@@ -1108,13 +1215,14 @@ class Trainer:
     
     def save_checkpoint(self, epoch: int, val_acc: float, val_loss: float, n_features: int):
         """Save model checkpoint."""
+        snapshots = list(self.config.SNAPSHOTS)
         config_dict = {
             'N_CLASSES': self.config.N_CLASSES,
             'K_NEIGHBORS': self.config.K_NEIGHBORS,
             'HIDDEN_DIM': self.config.HIDDEN_DIM,
-            'SNAPSHOT': self.config.SNAPSHOT,
+            'SNAPSHOTS': snapshots,
         }
-        
+
         torch.save({
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -1124,6 +1232,7 @@ class Trainer:
             'config': config_dict,
             'n_features': n_features,
             'n_classes': self.config.N_CLASSES,
+            'snapshots': snapshots,
         }, self.config.MODEL_PATH)
     
     def train(self) -> nn.Module:
@@ -1240,6 +1349,7 @@ class Validator:
         self.uncertainty_quantifier = None
         self.plotter = None
         self.n_classes = None
+        self.snapshots = None
     
     def load_model_and_data(self):
         """Load trained model and validation dataset."""
@@ -1250,36 +1360,38 @@ class Validator:
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
             self.n_classes = checkpoint.get('n_classes', Config.N_CLASSES)
+            cfg = checkpoint.get('config', {})
+            self.snapshots = parse_snapshot_spec(
+                checkpoint.get('snapshots', cfg.get('SNAPSHOTS', Config.SNAPSHOTS))
+            )
         else:
             state_dict = checkpoint
             self.n_classes = Config.N_CLASSES
+            self.snapshots = parse_snapshot_spec(Config.SNAPSHOTS)
 
-        print("Loading dataset...")
+        print(f"Loading dataset (snapshots: {format_snapshots(self.snapshots)})...")
 
         # Generate simulation names
         sim_names = []
         for nsc in range(1, self.n_scs + 1):
             for seed in range(self.n_seeds):
                 sim_names.append(f"NSC{nsc}SEED{seed}")
-        
-        # Load dataset
+
+        # Load dataset (same snapshots the model was trained on)
         dataset = StarClusterGraphDataset(
             data_path=self.data_path,
             sim_names=sim_names,
-            snapshot=Config.SNAPSHOT,
+            snapshots=self.snapshots,
             k=Config.K_NEIGHBORS,
             n_classes=self.n_classes
         )
-        
-        # Split dataset (same split as training)
-        n_val = int(len(dataset) * Config.VAL_FRACTION)
-        n_train = len(dataset) - n_val
-        
-        _, val_set = random_split(
-            dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(42)
+
+        # Same sim-level split as training (matching seed)
+        _, val_idx = split_indices_by_simulation(
+            dataset.graph_sim_ids, Config.VAL_FRACTION, seed=42
         )
-        
+        val_set = Subset(dataset, val_idx)
+
         self.val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
         
         # Initialize model
@@ -1386,7 +1498,7 @@ class Validator:
 
         with open(save_path, 'w') as f:
             f.write("# StarTrace validation confusion matrix\n")
-            f.write(f"# snapshot: {Config.SNAPSHOT}\n")
+            f.write(f"# snapshot: {format_snapshots(self.snapshots)}\n")
             f.write(f"# n_classes: {self.n_classes}\n")
             f.write(f"# overall_accuracy: {overall:.6f}\n")
             f.write(f"# class_labels: {', '.join(labels)}\n")
@@ -1395,7 +1507,7 @@ class Validator:
 
             for i in range(self.n_classes):
                 for j in range(self.n_classes):
-                    f.write(f"{Config.SNAPSHOT} {i} {j} {int(cm[i, j])}\n")
+                    f.write(f"{format_snapshots(self.snapshots)} {i} {j} {int(cm[i, j])}\n")
 
         print(f"Saved confusion matrix / accuracy to {save_path}")
 
