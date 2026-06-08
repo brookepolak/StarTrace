@@ -1442,9 +1442,50 @@ class Validator:
                 acc = (predictions[mask] == cls).mean()
                 n = mask.sum()
                 print(f"  N_sc = {labels[cls]:>3s}: {acc*100:5.1f}%  (n={n})")
-        
+
         print(f"{'═'*60}\n")
-    
+
+    def save_accuracy(self, results: Dict, save_path: Path):
+        """
+        Save per-class (and overall) accuracy to a plain-text file.
+
+        The file is written in a loadtxt-friendly format with one row per
+        class, so accuracies from many snapshots can be concatenated and
+        plotted easily later. Columns are:
+
+            snapshot  class_index  accuracy  n_samples
+
+        Metadata (snapshot, n_classes, overall accuracy, class labels) is
+        stored in the leading comment lines.
+
+        Args:
+            results: Output of collect_predictions().
+            save_path: Destination .txt file.
+        """
+        predictions = results['predictions']
+        true_labels = results['true_labels']
+        labels = get_class_labels(self.n_classes)
+        overall = (predictions == true_labels).mean()
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(exist_ok=True, parents=True)
+
+        with open(save_path, 'w') as f:
+            f.write("# StarTrace per-class validation accuracy\n")
+            f.write(f"# snapshot: {Config.SNAPSHOT}\n")
+            f.write(f"# n_classes: {self.n_classes}\n")
+            f.write(f"# overall_accuracy: {overall:.6f}\n")
+            f.write(f"# class_labels: {', '.join(labels)}\n")
+            f.write("# snapshot class_index accuracy n_samples\n")
+
+            for cls in range(self.n_classes):
+                mask = true_labels == cls
+                n = int(mask.sum())
+                acc = (predictions[mask] == cls).mean() if n > 0 else float('nan')
+                f.write(f"{Config.SNAPSHOT} {cls} {acc:.6f} {n}\n")
+
+        print(f"Saved per-class accuracy to {save_path}")
+
     def run(self) -> Dict:
         """
         Run complete validation pipeline.
@@ -1464,7 +1505,10 @@ class Validator:
         
         # Print summary
         self.print_summary(results)
-        
+
+        # Save per-class accuracy table for easy plotting later
+        self.save_accuracy(results, self.output_dir / "accuracy.txt")
+
         # Generate plots
         print("\nGenerating validation plots...")
         

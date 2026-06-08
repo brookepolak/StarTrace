@@ -2,17 +2,42 @@
 Star Cluster Analysis - Evolution Over Time
 ===========================================
 
-Analyzes how RMS radius and dynamical relaxation time evolve during collapse.
+Computes the half-mass radius (HMR) and dynamical relaxation time for each
+simulation and saves the time series to an HDF5 file for easy plotting later.
+
+The module is organised around a single ``ClusterAnalysis`` class whose
+methods are split into two groups:
+
+    * Processing   - load snapshots, compute HMR / relaxation time, save to HDF5
+    * Plotting     - read the time series back and make figures
+
+A lightweight ``ClusterAnalysisReader`` is provided so the saved data can be
+consumed elsewhere with a simple mapping interface::
+
+    from sc_analysis import ClusterAnalysisReader
+
+    reader = ClusterAnalysisReader("cluster_evolution.h5")
+    t   = reader["NSC3SEED0"]["time"]
+    hmr = reader["NSC3SEED0"]["hmr"]
+    trx = reader["NSC3SEED0"]["t_relax"]
 
 Usage:
-    python sc_analysis.py --data_path /path/to/sims/ --nsc 3 --seed 42
+    # Process all sims and write the HDF5 file (+ a combined plot)
     python sc_analysis.py --data_path /path/to/sims/ --compare_all
+
+    # Process a single simulation
+    python sc_analysis.py --data_path /path/to/sims/ --nsc 3 --seed 42
+
+    # Re-plot from an existing HDF5 file without re-processing
+    python sc_analysis.py --from_h5 cluster_evolution.h5
 """
+
+import argparse
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
-import argparse
+import h5py
 
 # Beautiful colormap
 try:
@@ -30,398 +55,550 @@ plt.rcParams.update({
 })
 
 
-class ClusterAnalyzer:
-    """Analyze star cluster evolution over time."""
-    
-    def __init__(self, data_path: str, nsc: int, seed: int):
+# ═════════════════════════════════════════════════════════════════════
+# READER
+# ═════════════════════════════════════════════════════════════════════
+
+class _SimView:
+    """
+    Mapping view over a single simulation group in the HDF5 file.
+
+    Indexing returns the underlying data as a NumPy array, so that
+    ``reader['sim']['hmr']`` yields an array directly.
+    """
+
+    def __init__(self, group: h5py.Group):
+        self._group = group
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._group[key][...]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._group
+
+    def keys(self):
+        return list(self._group.keys())
+
+    def items(self):
+        return [(k, self[k]) for k in self.keys()]
+
+    @property
+    def attrs(self) -> dict:
+        return dict(self._group.attrs)
+
+    def __repr__(self):
+        return f"<SimView {self._group.name} fields={self.keys()}>"
+
+
+class ClusterAnalysisReader:
+    """
+    Read-only accessor for a ClusterAnalysis HDF5 file.
+
+    Supports a dict-like interface keyed by simulation name::
+
+        reader = ClusterAnalysisReader("cluster_evolution.h5")
+        reader["NSC3SEED0"]["time"]      # -> np.ndarray
+        reader["NSC3SEED0"]["hmr"]       # -> np.ndarray
+        reader["NSC3SEED0"]["t_relax"]   # -> np.ndarray
+        list(reader)                      # -> list of sim names
+
+    Can be used as a context manager to auto-close the file.
+    """
+
+    def __init__(self, h5_path: str):
+        self.h5_path = Path(h5_path)
+        if not self.h5_path.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
+        self._file = h5py.File(self.h5_path, 'r')
+
+    def __getitem__(self, sim: str) -> _SimView:
+        return _SimView(self._file[sim])
+
+    def __contains__(self, sim: str) -> bool:
+        return sim in self._file
+
+    def __iter__(self):
+        return iter(self._file.keys())
+
+    def __len__(self):
+        return len(self._file.keys())
+
+    def keys(self):
+        return list(self._file.keys())
+
+    def sims(self):
+        """List of simulation names in the file."""
+        return list(self._file.keys())
+
+    @property
+    def attrs(self) -> dict:
+        """Global file-level attributes (e.g. units, settings)."""
+        return dict(self._file.attrs)
+
+    def close(self):
+        self._file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __repr__(self):
+        return f"<ClusterAnalysisReader {self.h5_path.name} n_sims={len(self)}>"
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ANALYSIS
+# ═════════════════════════════════════════════════════════════════════
+
+class ClusterAnalysis:
+    """
+    Analyze star cluster evolution and persist the results.
+
+    Processing methods build a ``self.data`` dictionary keyed by simulation
+    name, each entry holding the time series::
+
+        self.data["NSC3SEED0"] = {
+            "time":    np.ndarray,   # snapshot index
+            "hmr":     np.ndarray,   # half-mass radius [pc]
+            "t_relax": np.ndarray,   # relaxation time  [Myr]
+            "nsc":     int,
+            "seed":    int,
+        }
+
+    Plotting methods consume ``self.data`` (populated either by processing or
+    by ``load_h5``).
+    """
+
+    # Fields that are stored as time-series datasets in the HDF5 file
+    SERIES_FIELDS = ("time", "hmr", "t_relax")
+
+    def __init__(self, data_path: str, n_seeds: int = 300,
+                 n_scs: int = 8, max_snapshot: int = 20):
         """
         Args:
-            data_path: Path to simulation directory
-            nsc: Number of subclusters (1-8)
-            seed: Random seed
+            data_path: Path to simulation directory (NSC*SEED* folders)
+            n_seeds: Number of random seeds per NSC class
+            n_scs: Maximum NSC value in dataset (1..n_scs)
+            max_snapshot: Maximum snapshot index to analyze
         """
-        self.data_path = Path(data_path)
-        self.nsc = nsc
-        self.seed = seed
-        self.sim_name = f"NSC{nsc}SEED{seed}"
-        self.sim_dir = self.data_path / self.sim_name
-        
-        if not self.sim_dir.exists():
-            raise FileNotFoundError(f"Simulation not found: {self.sim_dir}")
-        
-        # Storage for time series
-        self.times = []
-        self.rms_radii = []
-        self.relaxation_times = []
-    
-    def load_snapshot(self, snapshot: int):
-        """Load a single snapshot."""
-        filename = self.sim_dir / f"data.{snapshot}"
-        
+        self.data_path = Path(data_path) if data_path is not None else None
+        self.n_seeds = n_seeds
+        self.n_scs = n_scs
+        self.max_snapshot = max_snapshot
+
+        # sim_name -> dict of time series + metadata
+        self.data = {}
+
+    # ─────────────────────────────────────────────────────────────────
+    # PROCESSING
+    # ─────────────────────────────────────────────────────────────────
+
+    def load_snapshot(self, sim_dir: Path, snapshot: int):
+        """
+        Load a single snapshot file.
+
+        Returns:
+            (masses, positions, velocities) or None if missing/corrupted.
+        """
+        filename = sim_dir / f"data.{snapshot}"
+
         if not filename.exists():
             return None
-        
+
         try:
-            # Load data: columns are mass, x, y, z, vx, vy, vz
+            # Columns: mass, x, y, z, vx, vy, vz
             data = np.loadtxt(filename, skiprows=1)
-            
+
             masses = data[:, 0]
-            positions = data[:, 1:4]  # x, y, z
-            velocities = data[:, 4:7]  # vx, vy, vz
-            
+            positions = data[:, 1:4]
+            velocities = data[:, 4:7]
+
             return masses, positions, velocities
-        
+
         except ValueError as e:
-            # Handle corrupted files (inconsistent number of columns)
             if "number of columns changed" in str(e):
                 print(f"  Warning: Corrupted file {filename.name}, skipping...")
                 return None
-            else:
-                raise  # Re-raise if it's a different ValueError
-        
+            raise
+
         except Exception as e:
-            # Catch any other errors
             print(f"  Warning: Error loading {filename.name}: {e}")
             return None
-    
+
     def compute_center_of_mass(self, masses, positions, velocities):
         """Compute COM position and velocity."""
         total_mass = masses.sum()
         com_pos = (masses[:, None] * positions).sum(axis=0) / total_mass
         com_vel = (masses[:, None] * velocities).sum(axis=0) / total_mass
-        
         return com_pos, com_vel
-    
-    def compute_rms_radius(self, masses, positions, com_pos):
-        """Compute RMS radius from center of mass."""
-        r = positions - com_pos  # Relative positions
-        r_mag = np.linalg.norm(r, axis=1)  # Distances from COM
-        
-        # Mass-weighted RMS radius
-        total_mass = masses.sum()
-        rms_radius = np.sqrt((masses * r_mag**2).sum() / total_mass)
-        
-        return rms_radius
-    
-    def compute_relaxation_time(self, masses, positions, velocities, 
-                                com_pos, com_vel, rms_radius):
+
+    def compute_half_mass_radius(self, masses, positions, com_pos):
         """
-        Compute dynamical relaxation time.
-        
-        Formula: t_relax = 2 * N * R_rms / (8 * ln(N) * <v>)
-        
+        Compute the half-mass radius (HMR) from the center of mass.
+
+        The HMR is the radius of the sphere (centered on the COM) that
+        encloses half of the total cluster mass.
+        """
+        r = positions - com_pos
+        r_mag = np.linalg.norm(r, axis=1)
+
+        # Sort stars by distance from COM and accumulate mass
+        order = np.argsort(r_mag)
+        r_sorted = r_mag[order]
+        m_cumulative = np.cumsum(masses[order])
+
+        half_mass = 0.5 * m_cumulative[-1]
+        idx = np.searchsorted(m_cumulative, half_mass)
+        idx = min(idx, len(r_sorted) - 1)
+
+        return r_sorted[idx]
+
+    def compute_relaxation_time(self, masses, positions, velocities,
+                                com_pos, com_vel, radius):
+        """
+        Compute the dynamical (half-mass) relaxation time.
+
+        Formula: t_relax = 2 * N * R / (8 * ln(N) * <v>)
+
         where:
-            N = number of stars
-            R_rms = RMS radius from COM
-            <v> = average velocity in COM frame
+            N   = number of stars
+            R   = characteristic radius (here the half-mass radius)
+            <v> = mean speed in the COM frame
         """
         N = len(masses)
-        
-        # Velocities in COM frame
+
         v_com_frame = velocities - com_vel
         v_mag = np.linalg.norm(v_com_frame, axis=1)
-        
-        # Average velocity
         avg_velocity = v_mag.mean()
-        
-        # Relaxation time
-        if avg_velocity > 0:
-            t_relax = 2 * N * rms_radius / (8 * np.log(N) * avg_velocity)
+
+        if avg_velocity > 0 and N > 1:
+            t_relax = 2 * N * radius / (8 * np.log(N) * avg_velocity)
         else:
             t_relax = np.inf
-        
+
         return t_relax
-    
-    def analyze_evolution(self, max_snapshot: int = 20):
-        """Analyze cluster evolution over time."""
-        print(f"\nAnalyzing {self.sim_name}...")
-        
-        for snapshot in range(max_snapshot + 1):
-            result = self.load_snapshot(snapshot)
-            
+
+    def process_sim(self, nsc: int, seed: int):
+        """
+        Process one simulation: compute the HMR and relaxation-time series.
+
+        Returns:
+            A data dict (see class docstring) or None if no valid snapshots.
+        """
+        sim_name = f"NSC{nsc}SEED{seed}"
+        sim_dir = self.data_path / sim_name
+
+        if not sim_dir.exists():
+            return None
+
+        times, hmrs, t_relaxes = [], [], []
+
+        for snapshot in range(self.max_snapshot + 1):
+            result = self.load_snapshot(sim_dir, snapshot)
             if result is None:
                 continue
-            
+
             masses, positions, velocities = result
-            
-            # Compute COM
+
             com_pos, com_vel = self.compute_center_of_mass(
                 masses, positions, velocities
             )
-            
-            # Compute RMS radius
-            rms_radius = self.compute_rms_radius(masses, positions, com_pos)
-            
-            # Compute relaxation time
+            hmr = self.compute_half_mass_radius(masses, positions, com_pos)
             t_relax = self.compute_relaxation_time(
-                masses, positions, velocities, 
-                com_pos, com_vel, rms_radius
+                masses, positions, velocities, com_pos, com_vel, hmr
             )
-            
-            # Store
-            self.times.append(snapshot)
-            self.rms_radii.append(rms_radius)
-            self.relaxation_times.append(t_relax)
-        
-        # Convert to arrays
-        self.times = np.array(self.times)
-        self.rms_radii = np.array(self.rms_radii)
-        self.relaxation_times = np.array(self.relaxation_times)
-        
-        if len(self.times) == 0:
-            print(f"  ERROR: No valid snapshots loaded!")
-            return False
-        
-        print(f"  Loaded {len(self.times)} snapshots")
-        print(f"  RMS radius: {self.rms_radii[0]:.2f} → {self.rms_radii[-1]:.2f}")
-        print(f"  Relaxation time: {self.relaxation_times[0]:.2f} → {self.relaxation_times[-1]:.2f}")
-        
-        return True
+
+            times.append(snapshot)
+            hmrs.append(hmr)
+            t_relaxes.append(t_relax)
+
+        if not times:
+            return None
+
+        return {
+            "time": np.array(times),
+            "hmr": np.array(hmrs),
+            "t_relax": np.array(t_relaxes),
+            "nsc": nsc,
+            "seed": seed,
+        }
+
+    def process_all(self):
+        """
+        Process every available simulation (all NSC classes and seeds).
+
+        Populates ``self.data`` and returns it.
+        """
+        print(f"\nProcessing simulations from {self.data_path} ...")
+        n_loaded = 0
+
+        for nsc in range(1, self.n_scs + 1):
+            for seed in range(self.n_seeds):
+                sim = self.process_sim(nsc, seed)
+                if sim is None:
+                    continue
+                sim_name = f"NSC{nsc}SEED{seed}"
+                self.data[sim_name] = sim
+                n_loaded += 1
+
+        print(f"  Loaded {n_loaded} simulations.")
+        return self.data
+
+    def save_h5(self, h5_path: str):
+        """
+        Save ``self.data`` to an HDF5 file.
+
+        Layout::
+
+            /<sim_name>/time      (dataset)
+            /<sim_name>/hmr       (dataset)
+            /<sim_name>/t_relax   (dataset)
+            /<sim_name>           (attrs: nsc, seed)
+        """
+        if not self.data:
+            print("Nothing to save (no processed data).")
+            return
+
+        h5_path = Path(h5_path)
+        h5_path.parent.mkdir(exist_ok=True, parents=True)
+
+        with h5py.File(h5_path, 'w') as f:
+            # File-level metadata documenting units / conventions
+            f.attrs['description'] = "StarTrace cluster evolution time series"
+            f.attrs['time_units'] = "snapshot index"
+            f.attrs['hmr_units'] = "pc"
+            f.attrs['t_relax_units'] = "Myr"
+            f.attrs['max_snapshot'] = self.max_snapshot
+
+            for sim_name, sim in self.data.items():
+                grp = f.create_group(sim_name)
+                for field in self.SERIES_FIELDS:
+                    grp.create_dataset(field, data=sim[field])
+                grp.attrs['nsc'] = sim['nsc']
+                grp.attrs['seed'] = sim['seed']
+
+        print(f"Saved {len(self.data)} simulations to {h5_path}")
+
+    def load_h5(self, h5_path: str):
+        """
+        Load time series from an HDF5 file back into ``self.data``.
+
+        Useful for re-plotting without re-processing the raw snapshots.
+        """
+        with ClusterAnalysisReader(h5_path) as reader:
+            self.data = {}
+            for sim_name in reader.sims():
+                view = reader[sim_name]
+                self.data[sim_name] = {
+                    "time": view["time"],
+                    "hmr": view["hmr"],
+                    "t_relax": view["t_relax"],
+                    "nsc": int(view.attrs.get("nsc", 0)),
+                    "seed": int(view.attrs.get("seed", 0)),
+                }
+        print(f"Loaded {len(self.data)} simulations from {h5_path}")
+        return self.data
+
+    # ─────────────────────────────────────────────────────────────────
+    # PLOTTING
+    # ─────────────────────────────────────────────────────────────────
+
+    def _color_for_nsc(self, nsc: int):
+        """Map an NSC value (1..n_scs) to a colormap color."""
+        return CMAP((nsc - 1) / max(self.n_scs - 1, 1))
+
+    def _add_nsc_colorbar(self, ax):
+        """Attach an N_sc colorbar to the given axis."""
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+
+        norm = Normalize(vmin=1, vmax=self.n_scs)
+        sm = ScalarMappable(cmap=CMAP, norm=norm)
+        sm.set_array([])
+
+        cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+        cbar.set_label(r'$N_{\rm sc}$', fontsize=13, rotation=270, labelpad=20)
+        cbar.set_ticks(list(range(1, self.n_scs + 1)))
+        return cbar
+
+    def plot_hmr_evolution(self, save_path=None):
+        """Plot half-mass radius evolution for all simulations."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for sim in self.data.values():
+            ax.plot(sim["time"], sim["hmr"],
+                    linewidth=1.0, color=self._color_for_nsc(sim["nsc"]),
+                    alpha=0.3)
+
+        ax.set_xlabel('t [Myr]', fontsize=14)
+        ax.set_ylabel(r'$R_{\rm hm}$ [pc]', fontsize=14)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        self._add_nsc_colorbar(ax)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Saved HMR evolution to {save_path}")
+        plt.show()
+
+    def plot_relaxation_time_evolution(self, save_path=None):
+        """Plot relaxation time evolution for all simulations."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for sim in self.data.values():
+            mask = np.isfinite(sim["t_relax"])
+            ax.plot(sim["time"][mask], sim["t_relax"][mask],
+                    linewidth=1.0, color=self._color_for_nsc(sim["nsc"]),
+                    alpha=0.3)
+
+        ax.set_xlabel('t [Myr]', fontsize=14)
+        ax.set_ylabel(r'$t_{\rm relax}$ [Myr]', fontsize=14)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        self._add_nsc_colorbar(ax)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Saved relaxation time evolution to {save_path}")
+        plt.show()
+
+    def plot_combined(self, save_path=None):
+        """Plot HMR and relaxation time in a 2-panel figure with colorbar."""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+        for sim in self.data.values():
+            color = self._color_for_nsc(sim["nsc"])
+            ax1.plot(sim["time"], sim["hmr"],
+                     linewidth=1.0, color=color, alpha=0.3)
+
+            mask = np.isfinite(sim["t_relax"])
+            ax2.plot(sim["time"][mask], sim["t_relax"][mask],
+                     linewidth=1.0, color=color, alpha=0.3)
+
+        ax1.set_xlabel('t [Myr]', fontsize=13)
+        ax1.set_ylabel(r'$R_{\rm hm}$ [pc]', fontsize=13)
+        ax1.grid(True, alpha=0.3, linestyle='--')
+
+        ax2.set_xlabel('t [Myr]', fontsize=13)
+        ax2.set_ylabel(r'$t_{\rm relax}$ [Myr]', fontsize=13)
+        ax2.grid(True, alpha=0.3, linestyle='--')
+
+        self._add_nsc_colorbar(ax2)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Saved combined plot to {save_path}")
+        plt.show()
 
 
-def plot_rms_evolution(analyzers, save_path=None):
-    """Plot RMS radius evolution for multiple NSC classes."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    colors = [CMAP(i / 7) for i in range(8)]
-    
-    for analyzer in analyzers:
-        nsc = analyzer.nsc
-        color = colors[nsc - 1]
-        
-        ax.plot(analyzer.times, analyzer.rms_radii, 
-               linewidth=1.0, color=color, alpha=0.3)
-    
-    ax.set_xlabel('t [Myr]', fontsize=14)
-    ax.set_ylabel(r'$R_{\rm rms}$ [pc]', fontsize=14)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    
-    # Add colorbar
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
-    
-    norm = Normalize(vmin=1, vmax=8)
-    sm = ScalarMappable(cmap=CMAP, norm=norm)
-    sm.set_array([])
-    
-    cbar = plt.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label(r'$N_{\rm sc}$', fontsize=13, rotation=270, labelpad=20)
-    cbar.set_ticks([1, 2, 3, 4, 5, 6, 7, 8])
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved RMS evolution to {save_path}")
-    
-    plt.show()
-
-
-def plot_relaxation_time_evolution(analyzers, save_path=None):
-    """Plot relaxation time evolution for multiple NSC classes."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    colors = [CMAP(i / 7) for i in range(8)]
-    
-    for analyzer in analyzers:
-        nsc = analyzer.nsc
-        color = colors[nsc - 1]
-        
-        # Filter out infinities
-        mask = np.isfinite(analyzer.relaxation_times)
-        times = analyzer.times[mask]
-        t_relax = analyzer.relaxation_times[mask]
-        
-        ax.plot(times, t_relax, 
-               linewidth=1.0, color=color, alpha=0.3)
-    
-    ax.set_xlabel('t [Myr]', fontsize=14)
-    ax.set_ylabel(r'$t_{\rm relax}$ [Myr]', fontsize=14)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    
-    # Add colorbar
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
-    
-    norm = Normalize(vmin=1, vmax=8)
-    sm = ScalarMappable(cmap=CMAP, norm=norm)
-    sm.set_array([])
-    
-    cbar = plt.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label(r'$N_{\rm sc}$', fontsize=13, rotation=270, labelpad=20)
-    cbar.set_ticks([1, 2, 3, 4, 5, 6, 7, 8])
-    
-    # Optional: log scale if values vary widely
-    # ax.set_yscale('log')
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved relaxation time evolution to {save_path}")
-    
-    plt.show()
-
-
-def plot_combined(analyzers, save_path=None):
-    """Plot both metrics in a 2-panel figure with colorbar."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
-    colors = [CMAP(i / 7) for i in range(8)]
-    
-    # Panel 1: RMS radius
-    for analyzer in analyzers:
-        nsc = analyzer.nsc
-        color = colors[nsc - 1]
-        
-        ax1.plot(analyzer.times, analyzer.rms_radii, 
-                linewidth=1.0, color=color, alpha=0.3)
-    
-    ax1.set_xlabel('t [Myr]', fontsize=13)
-    ax1.set_ylabel(r'$R_{\rm rms}$ [pc]', fontsize=13)
-    ax1.grid(True, alpha=0.3, linestyle='--')
-    
-    # Panel 2: Relaxation time
-    for analyzer in analyzers:
-        nsc = analyzer.nsc
-        color = colors[nsc - 1]
-        
-        mask = np.isfinite(analyzer.relaxation_times)
-        times = analyzer.times[mask]
-        t_relax = analyzer.relaxation_times[mask]
-        
-        ax2.plot(times, t_relax, 
-                linewidth=1.0, color=color, alpha=0.3)
-    
-    ax2.set_xlabel('t [Myr]', fontsize=13)
-    ax2.set_ylabel(r'$t_{\rm relax}$ [Myr]', fontsize=13)
-    ax2.grid(True, alpha=0.3, linestyle='--')
-    
-    # Add colorbar on the right side
-    from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
-    
-    norm = Normalize(vmin=1, vmax=8)
-    sm = ScalarMappable(cmap=CMAP, norm=norm)
-    sm.set_array([])
-    
-    cbar = plt.colorbar(sm, ax=ax2, pad=0.02)
-    cbar.set_label(r'$N_{\rm sc}$', fontsize=13, rotation=270, labelpad=20)
-    cbar.set_ticks([1, 2, 3, 4, 5, 6, 7, 8])
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved combined plot to {save_path}")
-    
-    plt.show()
-
+# ═════════════════════════════════════════════════════════════════════
+# CLI
+# ═════════════════════════════════════════════════════════════════════
 
 def main(args):
     """Main analysis script."""
-    
+    analysis = ClusterAnalysis(
+        data_path=args.data_path,
+        n_seeds=args.n_seeds,
+        n_scs=args.n_scs,
+        max_snapshot=args.max_snapshot,
+    )
+
+    # ── Re-plot only, from an existing HDF5 file ──────────────────────
+    if args.from_h5:
+        print("\n" + "=" * 60)
+        print(f"Re-plotting from {args.from_h5}")
+        print("=" * 60)
+        analysis.load_h5(args.from_h5)
+        analysis.plot_combined(save_path=args.output_dir / "evolution_combined.png")
+        print("\nDone!\n")
+        return
+
+    # ── Process simulations ───────────────────────────────────────────
     if args.compare_all:
-        # Compare all NSC classes (all seeds)
-        print("\n" + "="*60)
-        print(f"Comparing all NSC classes (all {args.n_seeds} seeds)")
-        print("="*60)
-        
-        analyzers = []
-        for nsc in range(1, 9):
-            for seed in range(args.n_seeds):
-                try:
-                    analyzer = ClusterAnalyzer(args.data_path, nsc, seed=seed)
-                    success = analyzer.analyze_evolution(args.max_snapshot)
-                    if success:  # Only add if we got valid data
-                        analyzers.append(analyzer)
-                except FileNotFoundError:
-                    # Silently skip missing simulations
-                    pass
-        
-        print(f"\nSuccessfully loaded {len(analyzers)} simulations")
-        
-        if len(analyzers) == 0:
-            print("ERROR: No valid simulations found!")
-            return
-        
-        # Plot combined
-        plot_combined(analyzers, save_path=args.output_dir / "evolution_combined.png")
-        
-        # Or separate plots
-        # plot_rms_evolution(analyzers, save_path=args.output_dir / "rms_evolution.png")
-        # plot_relaxation_time_evolution(analyzers, save_path=args.output_dir / "relaxation_evolution.png")
-        
+        print("\n" + "=" * 60)
+        print(f"Processing all NSC classes (up to {args.n_seeds} seeds each)")
+        print("=" * 60)
+        analysis.process_all()
     else:
-        # Analyze single simulation
-        print("\n" + "="*60)
-        print(f"Analyzing NSC={args.nsc}, SEED={args.seed}")
-        print("="*60)
-        
-        analyzer = ClusterAnalyzer(args.data_path, args.nsc, args.seed)
-        success = analyzer.analyze_evolution(args.max_snapshot)
-        
-        if not success:
-            print("ERROR: Failed to load any valid snapshots!")
+        print("\n" + "=" * 60)
+        print(f"Processing NSC={args.nsc}, SEED={args.seed}")
+        print("=" * 60)
+        sim = analysis.process_sim(args.nsc, args.seed)
+        if sim is None:
+            print("ERROR: No valid snapshots found for this simulation!")
             return
-        
-        # Plot
-        plot_combined([analyzer], 
-                     save_path=args.output_dir / f"evolution_NSC{args.nsc}_SEED{args.seed}.png")
-    
-    print("\n" + "="*60)
+        analysis.data[f"NSC{args.nsc}SEED{args.seed}"] = sim
+
+    if not analysis.data:
+        print("ERROR: No valid simulations found!")
+        return
+
+    # ── Save to HDF5 ──────────────────────────────────────────────────
+    analysis.save_h5(args.output_h5)
+
+    # ── Plot ──────────────────────────────────────────────────────────
+    analysis.plot_combined(save_path=args.output_dir / "evolution_combined.png")
+
+    print("\n" + "=" * 60)
     print("Analysis complete!")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Analyze star cluster evolution"
+        description="Analyze star cluster evolution (HMR + relaxation time)"
     )
     parser.add_argument(
-        "--data_path",
-        type=str,
-        required=True,
-        help="Path to simulation directory"
+        "--data_path", type=str, default=None,
+        help="Path to simulation directory (required unless --from_h5)"
     )
     parser.add_argument(
-        "--nsc",
-        type=int,
-        default=3,
-        help="Number of subclusters (1-8)"
+        "--nsc", type=int, default=3,
+        help="Number of subclusters (1-8) for single-sim mode"
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed"
+        "--seed", type=int, default=0,
+        help="Random seed for single-sim mode"
     )
     parser.add_argument(
-        "--compare_all",
-        action="store_true",
-        help="Compare all NSC classes (uses all seeds)"
+        "--compare_all", action="store_true",
+        help="Process all NSC classes (all seeds)"
     )
     parser.add_argument(
-        "--n_seeds",
-        type=int,
-        default=300,
+        "--n_seeds", type=int, default=300,
         help="Number of random seeds per NSC class (for --compare_all)"
     )
     parser.add_argument(
-        "--max_snapshot",
-        type=int,
-        default=20,
+        "--n_scs", type=int, default=8,
+        help="Maximum NSC value in dataset"
+    )
+    parser.add_argument(
+        "--max_snapshot", type=int, default=20,
         help="Maximum snapshot to analyze"
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="outputs/analysis",
+        "--output_h5", type=str, default="outputs/analysis/cluster_evolution.h5",
+        help="Path to output HDF5 file"
+    )
+    parser.add_argument(
+        "--from_h5", type=str, default=None,
+        help="Skip processing and re-plot from an existing HDF5 file"
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default="outputs/analysis",
         help="Directory to save plots"
     )
-    
+
     args = parser.parse_args()
     args.output_dir = Path(args.output_dir)
     args.output_dir.mkdir(exist_ok=True, parents=True)
-    
+    args.output_h5 = Path(args.output_h5)
+
+    if args.data_path is None and args.from_h5 is None:
+        parser.error("--data_path is required unless --from_h5 is given")
+
     main(args)

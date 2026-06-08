@@ -24,6 +24,9 @@ numpy>=1.24.0
 scipy>=1.10.0
 astropy>=4.3.1
 
+# Data I/O
+h5py>=3.8.0
+
 # Visualization
 matplotlib>=3.7.0
 cmasher>=1.6.0
