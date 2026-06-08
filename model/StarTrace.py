@@ -21,7 +21,6 @@ Functions:
     class_to_label: Convert class index to readable label
     load_simulation_data: Load simulation snapshot files
     derive_physical_features: Compute per-star features
-    compute_global_features: Compute cluster-level features
 
 Author: Brooke Polak
 License: MIT
@@ -74,7 +73,6 @@ class Config:
         SNAPSHOT (int): Which simulation snapshot to load (timestep)
         K_NEIGHBORS (int): Number of nearest neighbors for k-NN graph construction
         HIDDEN_DIM (int): Hidden layer dimensionality in GNN
-        USE_GLOBAL_FEATURES (bool): Whether to include cluster-level features
         BATCH_SIZE (int): Training batch size
         EPOCHS (int): Maximum number of training epochs
         LR (float): Learning rate for Adam optimizer
@@ -96,8 +94,7 @@ class Config:
     # Model architecture
     K_NEIGHBORS = 32        # k-NN graph connectivity in phase space
     HIDDEN_DIM = 128        # Hidden layer dimensionality
-    USE_GLOBAL_FEATURES = False  # Include cluster-level features
-    
+
     # Training parameters
     BATCH_SIZE = 64
     EPOCHS = 100
@@ -315,86 +312,18 @@ def load_simulation_data(data_path: str, sim_name: str, snapshot: int) -> Tuple[
     return True, coords.astype(np.float32), n_subclusters
 
 
-def compute_global_features(coords: np.ndarray) -> np.ndarray:
-    """
-    Compute global cluster-level features.
-    
-    These are statistical properties of the entire cluster, broadcast to
-    each star node. Note: experiments showed these did not significantly
-    improve accuracy, so USE_GLOBAL_FEATURES defaults to False.
-    
-    Args:
-        coords: (N, 6) array of standardized [x, y, z, vx, vy, vz]
-    
-    Returns:
-        (7,) array of global properties:
-            [0] Half-mass radius
-            [1] Position dispersion
-            [2] Velocity dispersion
-            [3] Velocity anisotropy
-            [4] Virial ratio (KE/|PE|)
-            [5] Total angular momentum magnitude
-            [6] Log number of stars
-    """
-    pos = coords[:, :3]
-    vel = coords[:, 3:]
-    
-    # 1. Half-mass radius
-    r = np.linalg.norm(pos, axis=1)
-    r_sorted = np.sort(r)
-    r_half = r_sorted[len(r_sorted) // 2]
-    
-    # 2. Position dispersion
-    pos_dispersion = np.sqrt(np.mean(pos ** 2))
-    
-    # 3. Velocity dispersion
-    vel_dispersion = np.sqrt(np.mean(vel ** 2))
-    
-    # 4. Velocity anisotropy
-    v_radial = np.abs((pos * vel).sum(axis=1) / (r + 1e-8))
-    v_tangential = np.sqrt(np.sum(vel**2, axis=1) - v_radial**2 + 1e-8)
-    anisotropy = (v_radial.mean() - v_tangential.mean()) / (v_radial.mean() + v_tangential.mean() + 1e-8)
-    
-    # 5. Virial ratio (approximate PE with sampling for speed)
-    KE_total = 0.5 * np.sum(vel ** 2)
-    n_sample = min(200, len(pos))
-    idx = np.random.choice(len(pos), n_sample, replace=False)
-    pos_sample = pos[idx]
-    PE_approx = 0.0
-    for i in range(len(pos_sample)):
-        dists = np.linalg.norm(pos_sample[i+1:] - pos_sample[i], axis=1)
-        PE_approx -= np.sum(1.0 / (dists + 0.1))
-    PE_approx *= (len(pos) / n_sample)**2
-    virial_ratio = KE_total / (abs(PE_approx) + 1e-8)
-    
-    # 6. Total angular momentum
-    L_total = np.cross(pos, vel).sum(axis=0)
-    L_total_mag = np.linalg.norm(L_total)
-    
-    # 7. Number of stars (log-scaled)
-    n_stars_log = np.log10(len(coords) + 1)
-    
-    return np.array([
-        r_half, pos_dispersion, vel_dispersion, anisotropy,
-        virial_ratio, L_total_mag, n_stars_log
-    ], dtype=np.float32)
-
-
-def derive_physical_features(coords: np.ndarray, include_global: bool = False) -> np.ndarray:
+def derive_physical_features(coords: np.ndarray) -> np.ndarray:
     """
     Compute per-star physical features from phase-space coordinates.
-    
+
     Transforms raw [x, y, z, vx, vy, vz] into physically meaningful features
     that help the GNN identify dynamical substructure.
-    
+
     Args:
         coords: (N, 6) array of standardized [x, y, z, vx, vy, vz]
-        include_global: If True, append global cluster features to each star
-    
+
     Returns:
-        (N, 13) array if include_global=False, or (N, 20) if True
-        
-        Per-star features (13):
+        (N, 13) array of per-star features:
             [0:3]   Position (x, y, z)
             [3:6]   Velocity (vx, vy, vz)
             [6]     Radial distance
@@ -402,29 +331,19 @@ def derive_physical_features(coords: np.ndarray, include_global: bool = False) -
             [8:11]  Angular momentum vector (Lx, Ly, Lz)
             [11]    Angular momentum magnitude
             [12]    Kinetic energy
-        
-        Global features (7, if included):
-            See compute_global_features() docstring
     """
     pos = coords[:, :3]
     vel = coords[:, 3:]
-    
+
     # Per-star derived quantities
     r_mag = np.linalg.norm(pos, axis=1, keepdims=True)
     v_mag = np.linalg.norm(vel, axis=1, keepdims=True)
     L = np.cross(pos, vel)
     L_mag = np.linalg.norm(L, axis=1, keepdims=True)
     KE = 0.5 * (vel ** 2).sum(axis=1, keepdims=True)
-    
-    per_star_features = np.hstack([coords, r_mag, v_mag, L, L_mag, KE])  # (N, 13)
-    
-    if include_global:
-        global_features = compute_global_features(coords)  # (7,)
-        global_features_broadcast = np.tile(global_features, (len(coords), 1))  # (N, 7)
-        features = np.hstack([per_star_features, global_features_broadcast])  # (N, 20)
-    else:
-        features = per_star_features  # (N, 13)
-    
+
+    features = np.hstack([coords, r_mag, v_mag, L, L_mag, KE])  # (N, 13)
+
     return features.astype(np.float32)
 
 
@@ -464,51 +383,44 @@ class StarClusterGraphDataset(Dataset):
     and prepares graph data objects for GNN training/inference.
     
     Each graph represents one star cluster with:
-        - Node features: per-star physical properties (13 or 20 dimensions)
+        - Node features: per-star physical properties (13 dimensions)
         - Edge structure: k-nearest neighbors in 6D phase space
         - Graph label: number of subclusters (mapped to class index)
-    
+
     Args:
         data_path: Base directory containing simulation folders
         sim_names: List of simulation names to load (e.g., ["NSC1SEED0", ...])
         snapshot: Which snapshot timestep to load
         k: Number of nearest neighbors for graph construction
-        use_global: Whether to include global cluster features
         n_classes: Number of classification classes (default: Config.N_CLASSES)
-    
+
     Attributes:
         graphs: List of PyTorch Geometric Data objects
         k: Number of neighbors in k-NN graph
-        use_global: Whether global features are included
     """
-    
-    def __init__(self, 
-                 data_path: str, 
-                 sim_names: List[str], 
-                 snapshot: int, 
+
+    def __init__(self,
+                 data_path: str,
+                 sim_names: List[str],
+                 snapshot: int,
                  k: int = None,
-                 use_global: bool = None,
                  n_classes: int = None):
         super().__init__()
-        
+
         if k is None:
             k = Config.K_NEIGHBORS
-        if use_global is None:
-            use_global = Config.USE_GLOBAL_FEATURES
         if n_classes is None:
             n_classes = Config.N_CLASSES
-        
+
         self.k = k
-        self.use_global = use_global
         self.n_classes = n_classes
         self.knn_transform = KNNGraph(k=k, loop=False, cosine=False)
         self.graphs = []
-        
+
         print(f"Loading {n_classes}-class dataset from {data_path}")
         print(f"Class mapping: {', '.join([f'{i+1}→{i}' if i < n_classes-1 else f'{i+1}+→{i}' for i in range(n_classes)])}")
         print(f"k-NN graph with k={k}")
-        print(f"Global features: {'ENABLED' if use_global else 'DISABLED'}")
-        
+
         # Load all simulations
         loaded_count = 0
         for sim_name in sim_names:
@@ -523,7 +435,7 @@ class StarClusterGraphDataset(Dataset):
             class_idx = map_nsc_to_class(n_subclusters, n_classes)
             
             # Derive features
-            features = derive_physical_features(coords, include_global=use_global)
+            features = derive_physical_features(coords)
             label = create_labels(class_idx, n_classes)
             
             # Create graph data object
@@ -1088,7 +1000,6 @@ class Trainer:
             sim_names=sim_names,
             snapshot=self.config.SNAPSHOT,
             k=self.config.K_NEIGHBORS,
-            use_global=self.config.USE_GLOBAL_FEATURES,
             n_classes=self.config.N_CLASSES
         )
         
@@ -1201,7 +1112,6 @@ class Trainer:
             'N_CLASSES': self.config.N_CLASSES,
             'K_NEIGHBORS': self.config.K_NEIGHBORS,
             'HIDDEN_DIM': self.config.HIDDEN_DIM,
-            'USE_GLOBAL_FEATURES': self.config.USE_GLOBAL_FEATURES,
             'SNAPSHOT': self.config.SNAPSHOT,
         }
         
@@ -1213,7 +1123,6 @@ class Trainer:
             'val_loss': val_loss,
             'config': config_dict,
             'n_features': n_features,
-            'use_global_features': self.config.USE_GLOBAL_FEATURES,
             'n_classes': self.config.N_CLASSES,
         }, self.config.MODEL_PATH)
     
@@ -1227,8 +1136,6 @@ class Trainer:
         print(f"\n{'═'*60}")
         print(f"StarTrace: {self.config.N_CLASSES}-Class Star Cluster GNN Training")
         print(f"Classes: {', '.join([class_to_label(i, self.config.N_CLASSES) for i in range(self.config.N_CLASSES)])}")
-        if self.config.USE_GLOBAL_FEATURES:
-            print("(WITH GLOBAL CLUSTER FEATURES)")
         print(f"{'═'*60}")
         print(f"Device: {self.config.DEVICE}")
         print(f"Data path: {self.data_path}")
@@ -1342,15 +1249,13 @@ class Validator:
         # Extract configuration
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
-            use_global = checkpoint.get('use_global_features', False)
             self.n_classes = checkpoint.get('n_classes', Config.N_CLASSES)
         else:
             state_dict = checkpoint
-            use_global = False
             self.n_classes = Config.N_CLASSES
-        
-        print(f"Loading dataset (use_global_features={use_global})...")
-        
+
+        print("Loading dataset...")
+
         # Generate simulation names
         sim_names = []
         for nsc in range(1, self.n_scs + 1):
@@ -1363,7 +1268,6 @@ class Validator:
             sim_names=sim_names,
             snapshot=Config.SNAPSHOT,
             k=Config.K_NEIGHBORS,
-            use_global=use_global,
             n_classes=self.n_classes
         )
         
@@ -1565,12 +1469,10 @@ class Predictor:
         if isinstance(checkpoint, dict):
             n_features = checkpoint.get('n_features', 13)
             self.n_classes = checkpoint.get('n_classes', Config.N_CLASSES)
-            self.use_global = checkpoint.get('use_global_features', False)
             state_dict = checkpoint.get('model_state_dict', checkpoint)
         else:
             n_features = 13
             self.n_classes = Config.N_CLASSES
-            self.use_global = False
             state_dict = checkpoint
         
         # Initialize model
@@ -1625,7 +1527,7 @@ class Predictor:
         """
         # Preprocess
         coords = self.preprocess_coordinates(coords)
-        features = derive_physical_features(coords, include_global=self.use_global)
+        features = derive_physical_features(coords)
         
         # Create graph
         data = Data(

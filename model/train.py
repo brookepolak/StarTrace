@@ -108,12 +108,7 @@ The model automatically handles imbalanced datasets using class weighting.
         default=128,
         help="Hidden layer dimensionality in GNN (default: 128)"
     )
-    model_group.add_argument(
-        "--use_global_features",
-        action="store_false",
-        help="Include global cluster-level features (may not improve accuracy)"
-    )
-    
+
     # Training arguments
     train_group = parser.add_argument_group('Training Parameters')
     train_group.add_argument(
@@ -180,7 +175,6 @@ def main():
         SNAPSHOT=args.snapshot,
         K_NEIGHBORS=args.k_neighbors,
         HIDDEN_DIM=args.hidden_dim,
-        USE_GLOBAL_FEATURES=args.use_global_features,
         BATCH_SIZE=args.batch_size,
         EPOCHS=args.epochs,
         LR=args.lr,
