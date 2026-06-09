@@ -297,20 +297,37 @@ def load_simulation_data(data_path: str, sim_name: str, snapshot: int) -> Tuple[
         First row is skipped (header)
     """
     filename = f"{data_path}{sim_name}/data.{snapshot}"
-    
+
     if not os.path.exists(filename):
         return False, None, None
-    
+
     # Load data: columns are [mass, x, y, z, vx, vy, vz]
-    data = np.loadtxt(filename, skiprows=1)
+    try:
+        data = np.loadtxt(filename, skiprows=1)
+    except ValueError as e:
+        # Some snapshot files have a corrupted/ragged row (inconsistent
+        # column count). Skip them rather than crashing the whole run.
+        if "number of columns changed" in str(e):
+            print(f"  Warning: Corrupted file {filename}, skipping...")
+            return False, None, None
+        raise
+    except Exception as e:
+        print(f"  Warning: Error loading {filename}: {e}, skipping...")
+        return False, None, None
+
+    # Guard against empty / single-row / too-few-column files
+    if data.ndim != 2 or data.shape[0] < 1 or data.shape[1] < 7:
+        print(f"  Warning: Unexpected shape {data.shape} in {filename}, skipping...")
+        return False, None, None
+
     coords = data[:, 1:7]  # Drop mass, keep position + velocity
-    
+
     # Extract true label from filename (e.g., NSC4SEED123 → 4)
     n_subclusters = int(re.findall(r"NSC(\d+)", sim_name)[0])
-    
+
     # Standardize: zero mean, unit variance per feature
     coords = (coords - coords.mean(axis=0)) / (coords.std(axis=0) + 1e-8)
-    
+
     return True, coords.astype(np.float32), n_subclusters
 
 
