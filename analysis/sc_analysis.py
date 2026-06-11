@@ -47,7 +47,7 @@ import h5py
 # Beautiful colormap
 try:
     import cmasher as cmr
-    CMAP = cmr.ocean
+    CMAP = cmr.dusk
 except ImportError:
     CMAP = plt.cm.viridis
 
@@ -517,7 +517,7 @@ class ClusterAnalysis:
         sm.set_array([])
 
         cbar = plt.colorbar(sm, ax=ax, pad=0.02)
-        cbar.set_label(r'$N_{\rm sc}$', fontsize=13, rotation=270, labelpad=20)
+        cbar.set_label(r'$N_{\rm sc}$', fontsize=13, labelpad=20)
         cbar.set_ticks(list(range(1, self.n_scs + 1)))
         return cbar
 
@@ -532,7 +532,6 @@ class ClusterAnalysis:
 
         ax.set_xlabel('t [Myr]', fontsize=14)
         ax.set_ylabel(r'$R_{\rm hm}$ [pc]', fontsize=14)
-        ax.grid(True, alpha=0.3, linestyle='--')
         self._add_nsc_colorbar(ax)
 
         plt.tight_layout()
@@ -547,13 +546,12 @@ class ClusterAnalysis:
 
         for sim in self.data.values():
             mask = np.isfinite(sim["t_relax"])
-            ax.plot(sim["time"][mask], sim["t_relax"][mask],
+            ax.semilogy(sim["time"][mask], sim["t_relax"][mask],
                     linewidth=1.0, color=self._color_for_nsc(sim["nsc"]),
                     alpha=0.3)
 
         ax.set_xlabel('t [Myr]', fontsize=14)
         ax.set_ylabel(r'$t_{\rm relax}$ [Myr]', fontsize=14)
-        ax.grid(True, alpha=0.3, linestyle='--')
         self._add_nsc_colorbar(ax)
 
         plt.tight_layout()
@@ -572,16 +570,14 @@ class ClusterAnalysis:
                      linewidth=1.0, color=color, alpha=0.3)
 
             mask = np.isfinite(sim["t_relax"])
-            ax2.plot(sim["time"][mask], sim["t_relax"][mask],
+            ax2.semilogy(sim["time"][mask], sim["t_relax"][mask],
                      linewidth=1.0, color=color, alpha=0.3)
 
         ax1.set_xlabel('t [Myr]', fontsize=13)
         ax1.set_ylabel(r'$R_{\rm hm}$ [pc]', fontsize=13)
-        ax1.grid(True, alpha=0.3, linestyle='--')
 
         ax2.set_xlabel('t [Myr]', fontsize=13)
         ax2.set_ylabel(r'$t_{\rm relax}$ [Myr]', fontsize=13)
-        ax2.grid(True, alpha=0.3, linestyle='--')
 
         self._add_nsc_colorbar(ax2)
 

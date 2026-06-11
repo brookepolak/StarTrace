@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 # Beautiful colormap
 try:
     import cmasher as cmr
-    CMAP = cmr.ocean
+    CMAP = cmr.sapphire
 except ImportError:
     CMAP = plt.cm.viridis
 
@@ -291,8 +291,8 @@ def plot_accuracy_over_time(analyzer, save_path=None):
             linestyle='--', linewidth=1.5, color='black',
             alpha=0.7, label='Overall')
 
-    ax.set_xlabel('Snapshot', fontsize=14)
-    ax.set_ylabel('Accuracy [%]', fontsize=14)
+    ax.set_xlabel('t [Myr]', fontsize=14)
+    ax.set_ylabel('accuracy [%]', fontsize=14)
     ax.set_ylim(0, 100)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.legend(title=r'$N_{\rm sc}$ class', fontsize=10,
